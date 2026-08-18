@@ -9,7 +9,7 @@ plugins {
 }
 
 group = "net.player005.vanillablocking"
-version = "1.3.0"
+version = "1.3.1"
 description = "Allows blocking your sword to reduce taken damage like in older Minecraft versions"
 
 java {
