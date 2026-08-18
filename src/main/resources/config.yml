@@ -17,7 +17,7 @@
 # When a plugin update adds or changes options, your config is migrated
 # automatically and a backup of your old file is kept next to it.
 # Do not edit this value!
-config-version: 1
+config-version: 2
 
 # Master switch for the whole plugin.
 enabled: true
@@ -39,6 +39,38 @@ damage-reduction:
 # Authentic 1.8.9 value: 1.0 (blocking never reduced knockback).
 # Some 1.8-style PvP servers prefer values around 0.6-0.8.
 knockback-multiplier: 1.0
+
+block-hitting:
+  # Block-hitting: attacking while blocking, the classic 1.8.9 PvP
+  # technique. When true, attacking never interrupts your block.
+  # Authentic 1.8.9 value: true
+  enabled: true
+
+  # Outgoing melee damage dealt while blocking is multiplied by this.
+  # Authentic 1.8.9 value: 1.0 (block-hits dealt full damage).
+  # Servers that want to soften block-hitting sometimes use ~0.8.
+  attack-damage-multiplier: 1.0
+
+  # Only used when 'enabled' is false: attacking interrupts the block and
+  # prevents blocking again for this many ticks (20 ticks = 1 second).
+  # Not applicable to 1.8.9 (block-hitting was always allowed).
+  interrupt-ticks: 10
+
+# The items that can be used to block. Two kinds of entries are supported:
+#   "#namespace:tag"  - every item in an item tag, e.g. "#minecraft:swords"
+#   "namespace:item"  - a single item,             e.g. "minecraft:trident"
+# Datapack-added tags and items work too.
+# Note: items that are already consumable on their own (food, potions,
+# milk, ...) cannot be used for blocking and are skipped.
+# Authentic 1.8.9 value: just the swords tag.
+#
+# Example - allow swords, all axes and the trident to block:
+# blockable-items:
+#   - "#minecraft:swords"
+#   - "#minecraft:axes"
+#   - "minecraft:trident"
+blockable-items:
+  - "#minecraft:swords"
 
 # The damage causes that blocking protects against.
 # The 1.8.9 rule was: any damage that armor reduces can also be blocked.
@@ -68,11 +100,19 @@ blockable-damage-causes:
   - THORNS
 
 restrictions:
-  # Whether a sword held in the offhand can block.
+  # Whether you can block while a shield is in your offhand.
+  # If false, blocking items temporarily lose the ability to block while a
+  # shield is held, so right-click raises the shield as usual. If true,
+  # the sword blocks instead and the shield never raises.
+  # 1.8.9 had no shields, so there is no authentic value; false gives the
+  # most predictable behavior alongside modern items.
+  allow-with-shield: false
+
+  # Whether an item held in the offhand can block.
   # Authentic 1.8.9 value: false (1.8.9 had no offhand).
   allow-offhand: false
 
-  # Sword blocking is completely disabled in these worlds:
+  # Blocking is completely disabled in these worlds:
   # no blocking animation and no damage reduction.
   # Example:
   # disabled-worlds:

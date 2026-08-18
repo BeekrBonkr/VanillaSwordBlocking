@@ -9,7 +9,10 @@ The plugin **only** handles sword blocking - install it alongside a plugin like 
 
 - Uses the exact 1.8.9 blocking formula: `damage = (damage + 1) / 2`, applied before armor (a simple percentage multiplier is available as an alternative).
 - Only reduces damage types that were blockable in 1.8.9 (the vanilla rule: anything armor reduces can be blocked - so burning, fall damage, potions, wither etc. are **not** blocked).
+- **Block-hitting** works like in 1.8.9: attacking never interrupts your block. Admins can nerf outgoing block-hit damage or disable block-hitting entirely (attacking then interrupts the block for a configurable number of ticks).
 - Blocking only works with the main hand by default, since 1.8.9 had no offhand (configurable).
+- Holding a shield in the offhand disables sword blocking by default, so right-click raises the shield as usual (configurable - set `allow-with-shield: true` to let the sword win instead).
+- Configurable list of items that can block (`blockable-items`) - supports item tags like `#minecraft:swords` (the 1.8.9 default) and single items, including datapack-added ones.
 
 ## Configuration
 
