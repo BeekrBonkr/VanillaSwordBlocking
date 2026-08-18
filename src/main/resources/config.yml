@@ -1,0 +1,80 @@
+# ------------------------------------------------------------------------
+#  VanillaSwordBlocking
+#
+#  Brings back 1.8-style sword blocking: right-click with a sword to block
+#  and reduce incoming damage, with the classic blocking animation.
+#
+#  This plugin ONLY handles sword blocking. Install it alongside a plugin
+#  like OldCombatMechanics to restore the rest of 1.8.9 combat (no attack
+#  cooldown, old damage values, no sweep attacks, ...).
+#
+#  Every option's comment notes the authentic 1.8.9 value.
+#  Apply changes without a restart: /vanillablocking reload
+#  (alias: /vsb - permission: vanillablocking.admin)
+# ------------------------------------------------------------------------
+
+# Internal version of this file, used for automatic config updates.
+# When a plugin update adds or changes options, your config is migrated
+# automatically and a backup of your old file is kept next to it.
+# Do not edit this value!
+config-version: 1
+
+# Master switch for the whole plugin.
+enabled: true
+
+damage-reduction:
+  # How damage taken while blocking is reduced:
+  #   legacy     - the exact 1.8.9 formula: damage = (damage + 1) / 2
+  #                (a hit for 8.0 damage becomes 4.5, applied before armor)
+  #   multiplier - a simple percentage: damage = damage * multiplier
+  # Authentic 1.8.9 value: legacy
+  formula: legacy
+
+  # Fraction of damage still taken while blocking.
+  # Only used when 'formula' is set to 'multiplier'.
+  # 0.5 = take half damage, which is roughly what 1.8.9 did.
+  multiplier: 0.5
+
+# Knockback taken while blocking is multiplied by this value.
+# Authentic 1.8.9 value: 1.0 (blocking never reduced knockback).
+# Some 1.8-style PvP servers prefer values around 0.6-0.8.
+knockback-multiplier: 1.0
+
+# The damage causes that blocking protects against.
+# The 1.8.9 rule was: any damage that armor reduces can also be blocked.
+# The default list below reproduces that rule exactly on a modern server,
+# so it is the authentic 1.8.9 setup:
+#   melee hits, sweep attacks (didn't exist in 1.8.9, treated like melee -
+#   OldCombatMechanics usually disables them anyway), projectiles,
+#   explosions, standing in fire, lava, magma blocks, cactus contact,
+#   falling anvils, lightning and thorns.
+# Notable causes that were NOT blockable in 1.8.9 and are therefore not
+# listed: FALL, FIRE_TICK (burning), MAGIC, POISON, WITHER, SUFFOCATION,
+# DROWNING, STARVATION, VOID.
+# All valid names:
+# https://jd.papermc.io/paper/1.21.4/org/bukkit/event/entity/EntityDamageEvent.DamageCause.html
+blockable-damage-causes:
+  - ENTITY_ATTACK
+  - ENTITY_SWEEP_ATTACK
+  - PROJECTILE
+  - ENTITY_EXPLOSION
+  - BLOCK_EXPLOSION
+  - FIRE
+  - LAVA
+  - HOT_FLOOR
+  - CONTACT
+  - FALLING_BLOCK
+  - LIGHTNING
+  - THORNS
+
+restrictions:
+  # Whether a sword held in the offhand can block.
+  # Authentic 1.8.9 value: false (1.8.9 had no offhand).
+  allow-offhand: false
+
+  # Sword blocking is completely disabled in these worlds:
+  # no blocking animation and no damage reduction.
+  # Example:
+  # disabled-worlds:
+  #   - creative_world
+  disabled-worlds: []

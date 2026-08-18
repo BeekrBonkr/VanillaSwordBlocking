@@ -9,7 +9,7 @@ plugins {
 }
 
 group = "net.player005.vanillablocking"
-version = "1.2.0"
+version = "1.3.0"
 description = "Allows blocking your sword to reduce taken damage like in older Minecraft versions"
 
 java {
@@ -45,4 +45,10 @@ bukkitPluginYaml {
     apiVersion = "1.21"
     description = properties["description"] as String
     foliaSupported = true
+
+    commands.register("vanillablocking") {
+        description = "Admin command for VanillaSwordBlocking (reload the config)"
+        aliases = listOf("vsb")
+        permission = "vanillablocking.admin"
+    }
 }
