@@ -4,15 +4,20 @@ import io.papermc.paper.event.entity.EntityKnockbackEvent;
 import io.papermc.paper.event.player.PlayerInventorySlotChangeEvent;
 import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.format.NamedTextColor;
-import org.bukkit.Tag;
+import net.minecraft.world.InteractionHand;
+import net.minecraft.world.item.ItemUseAnimation;
+import org.bukkit.Material;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandSender;
 import org.bukkit.craftbukkit.entity.CraftPlayer;
 import org.bukkit.craftbukkit.inventory.CraftItemStack;
+import org.bukkit.craftbukkit.util.CraftMagicNumbers;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
+import org.bukkit.event.entity.EntityDamageByEntityEvent;
 import org.bukkit.event.entity.EntityDamageEvent;
+import org.bukkit.event.entity.EntityDamageEvent.DamageCause;
 import org.bukkit.event.player.PlayerChangedWorldEvent;
 import org.bukkit.event.player.PlayerItemHeldEvent;
 import org.bukkit.event.player.PlayerJoinEvent;
@@ -26,6 +31,9 @@ import org.jetbrains.annotations.Nullable;
 
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 
 public class VanillaBlockingPaper extends JavaPlugin implements Listener {
 
@@ -33,13 +41,21 @@ public class VanillaBlockingPaper extends JavaPlugin implements Listener {
 
     private PluginConfig config;
 
+    /**
+     * Only used when block-hitting is disabled: players who recently
+     * attacked while blocking, mapped to when they may block again
+     * (epoch milliseconds).
+     */
+    private final Map<UUID, Long> blockHitCooldowns = new ConcurrentHashMap<>();
+
     @Override
     public void onEnable() {
         config = new PluginConfig(this);
         config.load();
         getServer().getPluginManager().registerEvents(this, this);
 
-        // Handles being enabled on a running server (e.g. via a plugin manager)
+        // Handles being enabled on a running server (e.g. via a plugin
+        // manager or /reload)
         for (Player player : getServer().getOnlinePlayers()) {
             player.getScheduler().run(this, task -> updateInventory(player), null);
         }
@@ -48,23 +64,27 @@ public class VanillaBlockingPaper extends JavaPlugin implements Listener {
     @Override
     public void onDisable() {
         // On a normal shutdown players quit before plugins disable, so this
-        // only matters for runtime disables (e.g. via a plugin manager).
+        // only matters for runtime disables (e.g. plugin managers, /reload).
         for (Player player : getServer().getOnlinePlayers()) {
             try {
                 stripInventory(player);
             } catch (Exception ignored) {
             }
         }
+        blockHitCooldowns.clear();
     }
 
     @Override
     public boolean onCommand(@NotNull CommandSender sender, @NotNull Command command, @NotNull String label, @NotNull String @NotNull [] args) {
         if (args.length == 1 && args[0].equalsIgnoreCase("reload")) {
-            config.load();
-            for (Player player : getServer().getOnlinePlayers()) {
-                player.getScheduler().run(this, task -> updateInventory(player), null);
+            if (config.load()) {
+                for (Player player : getServer().getOnlinePlayers()) {
+                    player.getScheduler().run(this, task -> updateInventory(player), null);
+                }
+                sender.sendMessage(Component.text("VanillaSwordBlocking config reloaded.", NamedTextColor.GREEN));
+            } else {
+                sender.sendMessage(Component.text("config.yml contains errors - keeping the previous settings. See the console for details.", NamedTextColor.RED));
             }
-            sender.sendMessage(Component.text("VanillaSwordBlocking config reloaded.", NamedTextColor.GREEN));
             return true;
         }
         sender.sendMessage(Component.text("Usage: /" + label + " reload", NamedTextColor.RED));
@@ -86,9 +106,32 @@ public class VanillaBlockingPaper extends JavaPlugin implements Listener {
         if (!(event.getEntity() instanceof Player player)) return;
         if (!config.isActiveIn(player.getWorld())) return;
         if (!config.isBlockable(event.getCause())) return;
-        if (!VanillaBlocking.isBlockingSword(((CraftPlayer) player).getHandle(), config.allowOffhand())) return;
+        if (!isBlocking(player)) return;
 
         event.setDamage(config.applyBlocking(event.getDamage()));
+    }
+
+    /**
+     * Block-hitting: a player attacking while blocking. With block-hitting
+     * enabled (1.8.9 behavior) the block is never interrupted and an
+     * optional outgoing damage multiplier applies; with it disabled the
+     * block is interrupted and re-blocking is prevented for a while.
+     */
+    @EventHandler(ignoreCancelled = true)
+    public void onAttackWhileBlocking(@NotNull EntityDamageByEntityEvent event) {
+        if (!(event.getDamager() instanceof Player attacker)) return;
+        DamageCause cause = event.getCause();
+        if (cause != DamageCause.ENTITY_ATTACK && cause != DamageCause.ENTITY_SWEEP_ATTACK) return;
+        if (!config.isActiveIn(attacker.getWorld())) return;
+        if (!isBlocking(attacker)) return;
+
+        if (config.blockHittingEnabled()) {
+            if (config.blockHitDamageMultiplier() != 1.0) {
+                event.setDamage(event.getDamage() * config.blockHitDamageMultiplier());
+            }
+        } else {
+            interruptBlocking(attacker);
+        }
     }
 
     /**
@@ -100,7 +143,7 @@ public class VanillaBlockingPaper extends JavaPlugin implements Listener {
         if (config.knockbackMultiplier() == 1.0) return;
         if (!(event.getEntity() instanceof Player player)) return;
         if (!config.isActiveIn(player.getWorld())) return;
-        if (!VanillaBlocking.isBlockingSword(((CraftPlayer) player).getHandle(), config.allowOffhand())) return;
+        if (!isBlocking(player)) return;
 
         event.setKnockback(event.getKnockback().multiply(config.knockbackMultiplier()));
     }
@@ -111,11 +154,14 @@ public class VanillaBlockingPaper extends JavaPlugin implements Listener {
      */
     @EventHandler
     public void onSlotChange(@NotNull PlayerInventorySlotChangeEvent event) {
-        Player player = event.getPlayer();
-        if (!config.isActiveIn(player.getWorld())) return;
-        if (!isBlockingSlot(event.getSlot())) return;
-
-        applyToSlot(player.getInventory(), event.getSlot());
+        int slot = event.getSlot();
+        if (slot == OFFHAND_SLOT) {
+            // A shield (or offhand weapon) appearing or disappearing
+            // affects whether the whole hotbar may block
+            updateInventory(event.getPlayer());
+        } else if (slot >= 0 && slot <= 8) {
+            normalizeSlot(event.getPlayer(), slot);
+        }
     }
 
     /**
@@ -123,10 +169,7 @@ public class VanillaBlockingPaper extends JavaPlugin implements Listener {
      */
     @EventHandler
     public void onItemChangeEvent(@NotNull PlayerItemHeldEvent event) {
-        Player player = event.getPlayer();
-        if (!config.isActiveIn(player.getWorld())) return;
-
-        applyToSlot(player.getInventory(), event.getNewSlot());
+        normalizeSlot(event.getPlayer(), event.getNewSlot());
     }
 
     /**
@@ -151,6 +194,7 @@ public class VanillaBlockingPaper extends JavaPlugin implements Listener {
      */
     @EventHandler
     public void onDisconnect(@NotNull PlayerQuitEvent event) {
+        blockHitCooldowns.remove(event.getPlayer().getUniqueId());
         try {
             stripInventory(event.getPlayer());
         } catch (Exception ignored) {
@@ -165,67 +209,106 @@ public class VanillaBlockingPaper extends JavaPlugin implements Listener {
         }
     }
 
+    /**
+     * Whether the player is actively blocking right now, respecting all
+     * config restrictions. Only items with our BLOCK-animation component
+     * count, so eating food never triggers this.
+     */
+    private boolean isBlocking(@NotNull Player player) {
+        if (isOnBlockHitCooldown(player.getUniqueId())) return false;
+
+        var handle = ((CraftPlayer) player).getHandle();
+        var useItem = handle.getUseItem();
+        if (useItem.isEmpty() || useItem.getUseAnimation() != ItemUseAnimation.BLOCK) return false;
+        if (!config.isBlockableItem(CraftMagicNumbers.getMaterial(useItem.getItem()))) return false;
+        if (!config.allowOffhand() && handle.getUsedItemHand() != InteractionHand.MAIN_HAND) return false;
+        return !hasShieldConflict(player);
+    }
+
+    private boolean hasShieldConflict(@NotNull Player player) {
+        return !config.allowWithShield() && player.getInventory().getItemInOffHand().getType() == Material.SHIELD;
+    }
+
+    private boolean isOnBlockHitCooldown(@NotNull UUID uuid) {
+        Long expiry = blockHitCooldowns.get(uuid);
+        return expiry != null && System.currentTimeMillis() < expiry;
+    }
+
+    /**
+     * Interrupts a block (block-hitting disabled): stops the item use,
+     * strips the blocking components so the client lowers the item too,
+     * and restores them once the cooldown expires.
+     */
+    private void interruptBlocking(@NotNull Player player) {
+        ((CraftPlayer) player).getHandle().stopUsingItem();
+        blockHitCooldowns.put(player.getUniqueId(), System.currentTimeMillis() + config.interruptTicks() * 50L);
+        updateInventory(player);
+
+        player.getScheduler().runDelayed(this, task -> {
+            if (!isOnBlockHitCooldown(player.getUniqueId())) {
+                blockHitCooldowns.remove(player.getUniqueId());
+                updateInventory(player);
+            }
+        }, null, config.interruptTicks() + 1L);
+    }
+
     private boolean isBlockingSlot(int slot) {
         return (slot >= 0 && slot <= 8) || (slot == OFFHAND_SLOT && config.allowOffhand());
     }
 
-    private static boolean isSword(@Nullable ItemStack stack) {
-        return stack != null && Tag.ITEMS_SWORDS.isTagged(stack.getType());
-    }
-
     /**
-     * Adds the blocking component to the sword in the given slot, if missing.
+     * Ensures the item in the given slot has the blocking component exactly
+     * when it should: a configured blockable item, in a blocking slot, in a
+     * world where blocking is active, with no shield conflict or block-hit
+     * cooldown. Everything else gets the component stripped.
      */
-    private void applyToSlot(@NotNull PlayerInventory inventory, int slot) {
+    private void normalizeSlot(@NotNull Player player, int slot) {
+        PlayerInventory inventory = player.getInventory();
         ItemStack stack = inventory.getItem(slot);
-        if (!isSword(stack)) return;
+        if (stack == null || stack.getType().isAir()) return;
+        if (!config.isBlockableItem(stack.getType()) && !stack.hasItemMeta()) return;
 
         net.minecraft.world.item.ItemStack nms = CraftItemStack.asNMSCopy(stack);
-        if (VanillaBlocking.hasSwordComponents(nms)) return;
+        if (!VanillaBlocking.canReceiveBlockingComponent(nms)) return;
 
-        VanillaBlocking.addSwordComponents(nms);
+        boolean shouldBlock = config.isActiveIn(player.getWorld())
+                && config.isBlockableItem(stack.getType())
+                && isBlockingSlot(slot)
+                && !hasShieldConflict(player)
+                && !isOnBlockHitCooldown(player.getUniqueId());
+        if (VanillaBlocking.hasBlockingComponent(nms) == shouldBlock) return;
+
+        if (shouldBlock) {
+            VanillaBlocking.addBlockingComponent(nms);
+        } else {
+            VanillaBlocking.removeBlockingComponent(nms);
+        }
         inventory.setItem(slot, CraftItemStack.asBukkitCopy(nms));
     }
 
     /**
-     * Normalizes a whole inventory: swords in blocking slots gain the
-     * component, all other swords lose it.
+     * Normalizes a whole inventory.
      */
     private void updateInventory(@NotNull Player player) {
-        boolean active = config.isActiveIn(player.getWorld());
-        PlayerInventory inventory = player.getInventory();
-
-        for (int slot = 0; slot < inventory.getSize(); slot++) {
-            ItemStack stack = inventory.getItem(slot);
-            if (!isSword(stack)) continue;
-
-            boolean shouldBlock = active && isBlockingSlot(slot);
-            net.minecraft.world.item.ItemStack nms = CraftItemStack.asNMSCopy(stack);
-            if (VanillaBlocking.hasSwordComponents(nms) == shouldBlock) continue;
-
-            if (shouldBlock) {
-                VanillaBlocking.addSwordComponents(nms);
-            } else {
-                VanillaBlocking.removeSwordComponents(nms);
-            }
-            inventory.setItem(slot, CraftItemStack.asBukkitCopy(nms));
+        for (int slot = 0; slot < player.getInventory().getSize(); slot++) {
+            normalizeSlot(player, slot);
         }
     }
 
     /**
-     * Removes the blocking component from every sword in the inventory.
+     * Removes the blocking component from every item in the inventory.
      */
     private void stripInventory(@NotNull Player player) {
         PlayerInventory inventory = player.getInventory();
 
         for (int slot = 0; slot < inventory.getSize(); slot++) {
             ItemStack stack = inventory.getItem(slot);
-            if (!isSword(stack)) continue;
+            if (stack == null || stack.getType().isAir()) continue;
 
             net.minecraft.world.item.ItemStack nms = CraftItemStack.asNMSCopy(stack);
-            if (!VanillaBlocking.hasSwordComponents(nms)) continue;
+            if (!VanillaBlocking.hasBlockingComponent(nms)) continue;
 
-            VanillaBlocking.removeSwordComponents(nms);
+            VanillaBlocking.removeBlockingComponent(nms);
             inventory.setItem(slot, CraftItemStack.asBukkitCopy(nms));
         }
     }

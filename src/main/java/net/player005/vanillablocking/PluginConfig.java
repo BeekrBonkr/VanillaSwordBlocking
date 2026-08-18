@@ -1,10 +1,16 @@
 package net.player005.vanillablocking;
 
+import org.bukkit.Bukkit;
+import org.bukkit.Material;
+import org.bukkit.NamespacedKey;
+import org.bukkit.Registry;
+import org.bukkit.Tag;
 import org.bukkit.World;
 import org.bukkit.configuration.file.YamlConfiguration;
 import org.bukkit.event.entity.EntityDamageEvent.DamageCause;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
 
 import java.io.File;
 import java.io.IOException;
@@ -31,7 +37,7 @@ public final class PluginConfig {
      * the bundled defaults with all still-existing user values carried
      * over, and the old file is backed up.
      */
-    public static final int CURRENT_VERSION = 1;
+    public static final int CURRENT_VERSION = 2;
 
     public enum Formula {LEGACY, MULTIPLIER}
 
@@ -41,7 +47,12 @@ public final class PluginConfig {
     private Formula formula = Formula.LEGACY;
     private double multiplier = 0.5;
     private double knockbackMultiplier = 1.0;
+    private boolean blockHittingEnabled = true;
+    private double blockHitDamageMultiplier = 1.0;
+    private int interruptTicks = 10;
+    private boolean allowWithShield = false;
     private boolean allowOffhand = false;
+    private final Set<Material> blockableItems = EnumSet.noneOf(Material.class);
     private final Set<DamageCause> blockableCauses = EnumSet.noneOf(DamageCause.class);
     private final Set<String> disabledWorlds = new HashSet<>();
 
@@ -49,13 +60,25 @@ public final class PluginConfig {
         this.plugin = plugin;
     }
 
-    public void load() {
+    /**
+     * (Re)loads the config. Returns false if the file contains YAML errors,
+     * in which case the previous settings (or the built-in defaults on the
+     * first load) are kept and the user's file is left untouched.
+     */
+    public boolean load() {
         File file = new File(plugin.getDataFolder(), "config.yml");
         if (!file.exists()) {
             plugin.saveResource("config.yml", false);
         }
 
-        YamlConfiguration config = YamlConfiguration.loadConfiguration(file);
+        YamlConfiguration config = new YamlConfiguration();
+        try {
+            config.load(file);
+        } catch (Exception exception) {
+            plugin.getSLF4JLogger().error("config.yml contains errors and could not be loaded - keeping the previous settings. Fix the file and run /vanillablocking reload.", exception);
+            return false;
+        }
+
         int version = config.getInt("config-version", 0);
         if (version != CURRENT_VERSION) {
             try {
@@ -66,6 +89,7 @@ public final class PluginConfig {
             }
         }
         read(config);
+        return true;
     }
 
     /**
@@ -82,7 +106,7 @@ public final class PluginConfig {
 
         // Per-version migration steps for renamed/restructured options go
         // here before values are carried over, e.g.:
-        // if (oldVersion <= 1) old.set("new-key", old.get("old-key"));
+        // if (oldVersion <= 2) old.set("new-key", old.get("old-key"));
 
         for (String key : defaults.getKeys(true)) {
             if (defaults.isConfigurationSection(key)) continue;
@@ -117,11 +141,39 @@ public final class PluginConfig {
 
         multiplier = Math.max(0, config.getDouble("damage-reduction.multiplier", 0.5));
         knockbackMultiplier = Math.max(0, config.getDouble("knockback-multiplier", 1.0));
+
+        blockHittingEnabled = config.getBoolean("block-hitting.enabled", true);
+        blockHitDamageMultiplier = Math.max(0, config.getDouble("block-hitting.attack-damage-multiplier", 1.0));
+        interruptTicks = Math.max(1, config.getInt("block-hitting.interrupt-ticks", 10));
+
+        allowWithShield = config.getBoolean("restrictions.allow-with-shield", false);
         allowOffhand = config.getBoolean("restrictions.allow-offhand", false);
 
         disabledWorlds.clear();
         for (String world : config.getStringList("restrictions.disabled-worlds")) {
             disabledWorlds.add(world.toLowerCase(Locale.ROOT));
+        }
+
+        blockableItems.clear();
+        for (String entry : config.getStringList("blockable-items")) {
+            if (entry.startsWith("#")) {
+                Tag<Material> tag = itemTag(entry.substring(1));
+                if (tag == null) {
+                    plugin.getSLF4JLogger().warn("Ignoring unknown item tag '{}' in blockable-items.", entry);
+                    continue;
+                }
+                blockableItems.addAll(tag.getValues());
+            } else {
+                Material material = item(entry);
+                if (material == null) {
+                    plugin.getSLF4JLogger().warn("Ignoring unknown item '{}' in blockable-items.", entry);
+                    continue;
+                }
+                blockableItems.add(material);
+            }
+        }
+        if (blockableItems.isEmpty()) {
+            plugin.getSLF4JLogger().warn("blockable-items contains no valid entries - nothing will be able to block.");
         }
 
         blockableCauses.clear();
@@ -134,6 +186,19 @@ public final class PluginConfig {
         }
     }
 
+    private static @Nullable Tag<Material> itemTag(@NotNull String name) {
+        NamespacedKey key = NamespacedKey.fromString(name.toLowerCase(Locale.ROOT));
+        if (key == null) return null;
+        return Bukkit.getTag(Tag.REGISTRY_ITEMS, key, Material.class);
+    }
+
+    private static @Nullable Material item(@NotNull String name) {
+        NamespacedKey key = NamespacedKey.fromString(name.toLowerCase(Locale.ROOT));
+        if (key == null) return null;
+        Material material = Registry.MATERIAL.get(key);
+        return material != null && material.isItem() ? material : null;
+    }
+
     public boolean isEnabled() {
         return enabled;
     }
@@ -144,6 +209,26 @@ public final class PluginConfig {
 
     public boolean isBlockable(@NotNull DamageCause cause) {
         return blockableCauses.contains(cause);
+    }
+
+    public boolean isBlockableItem(@NotNull Material material) {
+        return blockableItems.contains(material);
+    }
+
+    public boolean blockHittingEnabled() {
+        return blockHittingEnabled;
+    }
+
+    public double blockHitDamageMultiplier() {
+        return blockHitDamageMultiplier;
+    }
+
+    public int interruptTicks() {
+        return interruptTicks;
+    }
+
+    public boolean allowWithShield() {
+        return allowWithShield;
     }
 
     public boolean allowOffhand() {
