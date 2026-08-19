@@ -1,0 +1,37 @@
+# ------------------------------------------------------------------------
+#  Player-facing messages, formatted with MiniMessage:
+#  https://docs.advntr.dev/minimessage/format.html
+#
+#  Placeholders are written as <name> and are listed with each message.
+#  Apply changes with /vanillablocking reload.
+# ------------------------------------------------------------------------
+
+# <label> - the command the player typed
+usage: "<red>Usage: /<label> <reload|refresh|cleanup|debug|toggle></red>"
+no-permission: "<red>You do not have permission to do that.</red>"
+players-only: "<red>Only players can use that.</red>"
+
+reload:
+  success: "<green>VanillaSwordBlocking config reloaded.</green>"
+  failed: "<red>config.yml contains errors - keeping the previous settings. See the console for details.</red>"
+
+# <players> - how many players were refreshed
+refresh:
+  done: "<green>Refreshed blocking items for <players> player(s).</green>"
+
+toggle:
+  enabled: "<green>Sword blocking enabled for you.</green>"
+  disabled: "<yellow>Sword blocking disabled for you.</yellow>"
+
+cleanup:
+  # <chunks> - how many loaded chunks are being scanned
+  started: "<gray>Cleaning leftover blocking components from <chunks> loaded chunk(s)...</gray>"
+  # <cleaned> - how many item stacks were cleaned
+  finished: "<green>Cleanup finished: <cleaned> item(s) cleaned.</green>"
+  # <world> - the name that was not found
+  unknown-world: "<red>No world named '<world>'.</red>"
+
+feedback:
+  # Shown in the action bar when feedback.action-bar is on.
+  # <blocked> - damage removed by the block, <hearts> - the same in hearts
+  blocked: "<gray>Blocked <white><blocked></white> damage</gray>"
