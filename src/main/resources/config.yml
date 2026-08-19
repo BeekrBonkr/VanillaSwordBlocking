@@ -2,7 +2,7 @@
 #  VanillaSwordBlocking
 #
 #  Brings back 1.8-style sword blocking: right-click with a sword to block
-#  and reduce incoming damage, with the classic blocking animation.
+#  and reduce taken damage, with the classic blocking animation.
 #
 #  This plugin ONLY handles sword blocking. Install it alongside a plugin
 #  like OldCombatMechanics to restore the rest of 1.8.9 combat (no attack
@@ -17,10 +17,23 @@
 # When a plugin update adds or changes options, your config is migrated
 # automatically and a backup of your old file is kept next to it.
 # Do not edit this value!
-config-version: 2
+config-version: 3
 
 # Master switch for the whole plugin.
 enabled: true
+
+# How items are made to block:
+#   auto           - native blocking on 1.21.5+, the consumable trick below
+#                    that. Recommended.
+#   consumable     - always fake it with the consumable component. The
+#                    damage reduction is then applied by the plugin, which
+#                    means a short client/server delay on every hit, but
+#                    every restriction below is enforced server-side.
+#   blocks-attacks - always use Minecraft's own blocks_attacks component
+#                    (1.21.5+ only). The client predicts the block itself,
+#                    so blocking feels instant.
+# Authentic 1.8.9 value: no equivalent - 'auto' is the best experience.
+strategy: auto
 
 damage-reduction:
   # How damage taken while blocking is reduced:
@@ -35,10 +48,54 @@ damage-reduction:
   # 0.5 = take half damage, which is roughly what 1.8.9 did.
   multiplier: 0.5
 
+  # Largest fraction of a hit that blocking may remove, as a safety net
+  # against blocking trivialising huge hits. 0.5 means a blocked hit always
+  # deals at least half its damage. Set to -1 for no cap.
+  # Authentic 1.8.9 value: -1 (no cap)
+  max-reduction: -1
+
+  # How far off-centre an attack can come from and still be blocked, in
+  # degrees. 180 blocks from every direction, 90 is the vanilla shield's
+  # frontal arc.
+  # Authentic 1.8.9 value: 180 (1.8.9 blocked attacks from behind too)
+  blocking-angle: 180
+
+  # How the plugin decides which damage types blocking protects against:
+  #   armor-applicable - the 1.8.9 rule, worked out per hit: anything armor
+  #                      reduces can be blocked. Also covers damage types
+  #                      added by datapacks and other plugins.
+  #   list             - only the causes in 'blockable-damage-causes' below.
+  # Authentic 1.8.9 value: armor-applicable
+  cause-rule: armor-applicable
+
+  # Optional per-item overrides for the fraction of damage still taken,
+  # for servers that want weaker swords to block worse.
+  # Example:
+  # per-item:
+  #   minecraft:wooden_sword: 0.75
+  #   minecraft:netherite_sword: 0.4
+  per-item: {}
+
 # Knockback taken while blocking is multiplied by this value.
 # Authentic 1.8.9 value: 1.0 (blocking never reduced knockback).
 # Some 1.8-style PvP servers prefer values around 0.6-0.8.
 knockback-multiplier: 1.0
+
+# Movement speed while blocking, as a fraction of normal walking speed.
+# Minecraft already slows you to about 0.2 while using any item, which is
+# what 1.8.9 did too - set this to -1 to leave that alone.
+# Authentic 1.8.9 value: -1
+movement-speed-multiplier: -1
+
+# How long a block has to be held before it reduces any damage, in ticks.
+# The usual reason to raise this is to make "reaction blocking" macros
+# useless (4 ticks is a common choice).
+# Authentic 1.8.9 value: 0
+block-delay-ticks: 0
+
+# Durability taken off the item every time it blocks a hit.
+# Authentic 1.8.9 value: 0 (blocking never damaged the sword)
+durability-cost: 0
 
 block-hitting:
   # Block-hitting: attacking while blocking, the classic 1.8.9 PvP
@@ -56,33 +113,34 @@ block-hitting:
   # Not applicable to 1.8.9 (block-hitting was always allowed).
   interrupt-ticks: 10
 
+  # Lowers the item for a moment on every block-hit, the way the 1.8.9
+  # client did. NOTE: the 1.8.9 flicker was purely client-side; all a
+  # server can do is actually stop the block, so the player has to press
+  # right-click again afterwards. Off unless you specifically want that.
+  # Authentic 1.8.9 value: no server-side equivalent
+  visual-flicker: false
+
 # The items that can be used to block. Two kinds of entries are supported:
 #   "#namespace:tag"  - every item in an item tag, e.g. "#minecraft:swords"
 #   "namespace:item"  - a single item,             e.g. "minecraft:trident"
 # Datapack-added tags and items work too.
-# Note: items that are already consumable on their own (food, potions,
-# milk, ...) cannot be used for blocking and are skipped.
+# Items whose right-click already does something (bows, tridents,
+# spyglasses, food, armor, ...) are refused, because the blocking component
+# would override that behaviour and break the item. See
+# restrictions.allow-unsafe-items if you want to override that.
 # Authentic 1.8.9 value: just the swords tag.
 #
-# Example - allow swords, all axes and the trident to block:
+# Example - allow swords and all axes to block:
 # blockable-items:
 #   - "#minecraft:swords"
 #   - "#minecraft:axes"
-#   - "minecraft:trident"
 blockable-items:
   - "#minecraft:swords"
 
-# The damage causes that blocking protects against.
+# Only used when damage-reduction.cause-rule is set to 'list'.
 # The 1.8.9 rule was: any damage that armor reduces can also be blocked.
-# The default list below reproduces that rule exactly on a modern server,
-# so it is the authentic 1.8.9 setup:
-#   melee hits, sweep attacks (didn't exist in 1.8.9, treated like melee -
-#   OldCombatMechanics usually disables them anyway), projectiles,
-#   explosions, standing in fire, lava, magma blocks, cactus contact,
-#   falling anvils, lightning and thorns.
-# Notable causes that were NOT blockable in 1.8.9 and are therefore not
-# listed: FALL, FIRE_TICK (burning), MAGIC, POISON, WITHER, SUFFOCATION,
-# DROWNING, STARVATION, VOID.
+# The list below reproduces that rule by hand, which is what older versions
+# of this plugin did before 'armor-applicable' existed.
 # All valid names:
 # https://jd.papermc.io/paper/1.21.4/org/bukkit/event/entity/EntityDamageEvent.DamageCause.html
 blockable-damage-causes:
@@ -109,8 +167,18 @@ restrictions:
   allow-with-shield: false
 
   # Whether an item held in the offhand can block.
-  # Authentic 1.8.9 value: false (1.8.9 had no offhand).
+  # Authentic 1.8.9 value: false (1.8.9 had no offhand)
   allow-offhand: false
+
+  # When true, only players with the permission 'vanillablocking.block'
+  # can block. The permission defaults to everyone, so this only matters
+  # if you deny it to some group.
+  require-permission: false
+
+  # When true, blocking only reduces damage dealt by other players, not by
+  # mobs, fire or explosions.
+  # Authentic 1.8.9 value: false
+  pvp-only: false
 
   # Blocking is completely disabled in these worlds:
   # no blocking animation and no damage reduction.
@@ -118,3 +186,63 @@ restrictions:
   # disabled-worlds:
   #   - creative_world
   disabled-worlds: []
+
+  # Game modes that cannot block. Creative and spectator players cannot be
+  # hurt anyway, so this mostly matters if you also want the animation gone.
+  # Authentic 1.8.9 value: [] (every game mode could block)
+  # Example:
+  # disabled-gamemodes:
+  #   - CREATIVE
+  #   - SPECTATOR
+  disabled-gamemodes: []
+
+  # Respect the WorldGuard 'sword-blocking' region flag, when WorldGuard is
+  # installed. Deny it in a region to turn blocking off there.
+  respect-worldguard-flag: true
+
+  # Turn sword blocking off for Bedrock players connected through Geyser.
+  # Bedrock clients handle held right-click differently, so blocking can
+  # feel unreliable for them.
+  disable-for-bedrock: false
+
+  # Allow items that blocking would break (bows, food, armor, ...) in
+  # 'blockable-items' anyway. Only turn this on if you know what you are
+  # doing - a bow made blockable can no longer be drawn.
+  allow-unsafe-items: false
+
+feedback:
+  # Sound played to a player who blocks a hit, as a namespaced sound key.
+  # Empty means silence, which is what 1.8.9 did.
+  # Example: "minecraft:item.shield.block"
+  sound: ""
+  volume: 1.0
+  pitch: 1.0
+
+  # Spawn a few crit particles on a successful block.
+  # Authentic 1.8.9 value: false
+  particles: false
+
+  # Show the 'feedback.blocked' message from lang.yml in the action bar.
+  # Authentic 1.8.9 value: false
+  action-bar: false
+
+oldcombatmechanics:
+  # Correct item tooltips to show the damage OldCombatMechanics actually
+  # deals. Purely cosmetic, and a no-op without OldCombatMechanics.
+  tooltip-compat: true
+
+  # OldCombatMechanics has no reload API, so the only way to notice its
+  # config changing (someone running its reload command, say) is to watch
+  # the file.
+  watch-config: true
+  watch-interval-seconds: 30
+
+update-checker:
+  # Check Modrinth for a newer release on startup and log a note if one
+  # exists. Nothing is ever downloaded or installed.
+  enabled: true
+  modrinth-project: "vanilla-sword-blocking"
+
+# Send anonymous usage statistics to bStats. Only takes effect once the
+# plugin has a bStats project id compiled in.
+metrics: true

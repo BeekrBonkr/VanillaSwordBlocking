@@ -1,353 +1,261 @@
 package net.player005.vanillablocking;
 
-import io.papermc.paper.event.entity.EntityKnockbackEvent;
-import io.papermc.paper.event.player.PlayerInventorySlotChangeEvent;
-import net.kyori.adventure.text.Component;
-import net.kyori.adventure.text.format.NamedTextColor;
-import net.minecraft.world.InteractionHand;
-import net.minecraft.world.item.ItemUseAnimation;
-import org.bukkit.Material;
-import org.bukkit.command.Command;
-import org.bukkit.command.CommandSender;
-import org.bukkit.craftbukkit.entity.CraftPlayer;
-import org.bukkit.craftbukkit.inventory.CraftItemStack;
-import org.bukkit.craftbukkit.util.CraftMagicNumbers;
+import io.papermc.paper.threadedregions.scheduler.ScheduledTask;
+import net.player005.vanillablocking.api.VanillaBlockingApi;
+import net.player005.vanillablocking.command.VanillaBlockingCommand;
+import net.player005.vanillablocking.compat.WorldGuardHook;
+import net.player005.vanillablocking.item.BlockingStrategies;
+import net.player005.vanillablocking.item.BlockingStrategy;
+import net.player005.vanillablocking.listener.CombatListener;
+import net.player005.vanillablocking.listener.ItemLifecycleListener;
+import net.player005.vanillablocking.listener.RegionListener;
+import net.player005.vanillablocking.ocm.OcmConfigReader;
+import net.player005.vanillablocking.ocm.OcmDamageDisplay;
+import org.bstats.bukkit.Metrics;
+import org.bstats.charts.SimplePie;
+import org.bukkit.Bukkit;
+import org.bukkit.command.PluginCommand;
 import org.bukkit.entity.Player;
-import org.bukkit.event.EventHandler;
-import org.bukkit.event.Listener;
-import org.bukkit.event.entity.EntityDamageByEntityEvent;
-import org.bukkit.event.entity.EntityDamageEvent;
-import org.bukkit.event.entity.EntityDamageEvent.DamageCause;
-import org.bukkit.event.player.PlayerChangedWorldEvent;
-import org.bukkit.event.player.PlayerItemHeldEvent;
-import org.bukkit.event.player.PlayerJoinEvent;
-import org.bukkit.event.player.PlayerKickEvent;
-import org.bukkit.event.player.PlayerQuitEvent;
-import org.bukkit.inventory.ItemStack;
-import org.bukkit.inventory.PlayerInventory;
 import org.bukkit.plugin.java.JavaPlugin;
-import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
-import java.util.List;
-import java.util.Locale;
-import java.util.Map;
-import java.util.UUID;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 
-public class VanillaBlockingPaper extends JavaPlugin implements Listener {
-
-    private static final int OFFHAND_SLOT = 40;
-
-    private PluginConfig config;
-    private OcmConfigReader ocmReader;
-    private OcmDamageDisplay ocmDisplay;
+/**
+ * Brings back 1.8-style sword blocking.
+ */
+public class VanillaBlockingPaper extends JavaPlugin {
 
     /**
-     * Only used when block-hitting is disabled: players who recently
-     * attacked while blocking, mapped to when they may block again
-     * (epoch milliseconds).
+     * bStats id for this plugin. Register the plugin at bstats.org and put
+     * the id here to turn metrics on; 0 leaves them off entirely.
      */
-    private final Map<UUID, Long> blockHitCooldowns = new ConcurrentHashMap<>();
+    private static final int BSTATS_PLUGIN_ID = 0;
+
+    private PluginConfig config;
+    private Messages messages;
+    private BlockingService service;
+    private ItemNormalizer normalizer;
+    private BlockingTracker tracker;
+
+    private OcmConfigReader ocmReader;
+    private OcmDamageDisplay ocmDisplay;
+    private WorldGuardHook worldGuard;
+
+    private @Nullable ScheduledTask ocmWatchTask;
+    private @Nullable Metrics metrics;
+
+    @Override
+    public void onLoad() {
+        // WorldGuard only accepts new flags before it enables.
+        WorldGuardHook.registerFlag(getSLF4JLogger());
+    }
 
     @Override
     public void onEnable() {
         config = new PluginConfig(this);
         config.load();
 
-        // OldCombatMechanics tooltip compatibility (no-op when OCM is absent)
+        messages = new Messages(this);
+        messages.load();
+
+        worldGuard = new WorldGuardHook();
+        worldGuard.enable(getSLF4JLogger());
+
         ocmReader = new OcmConfigReader();
         ocmReader.reload();
         ocmDisplay = new OcmDamageDisplay(this, ocmReader);
+        ocmDisplay.setEnabled(config.ocmTooltipCompat());
 
-        getServer().getPluginManager().registerEvents(this, this);
+        BlockingStrategy strategy = BlockingStrategies.create(config, getSLF4JLogger());
+        strategy.configure(config);
+        getSLF4JLogger().info("Using the '{}' blocking strategy.", strategy.id());
+
+        service = new BlockingService(this, config, strategy, worldGuard);
+        normalizer = new ItemNormalizer(service, ocmDisplay);
+        tracker = new BlockingTracker(this, service);
+
+        registerListeners();
+        registerCommand();
+        registerPlaceholders();
+        warnAboutOcmConflicts();
+        startOcmWatcher();
+        startUpdateChecker();
+        startMetrics();
+        VanillaBlockingApi.install(service, tracker);
 
         // Handles being enabled on a running server (e.g. via a plugin
         // manager or /reload)
-        for (Player player : getServer().getOnlinePlayers()) {
-            player.getScheduler().run(this, task -> updateInventory(player), null);
-        }
+        refreshAllPlayers();
     }
 
     @Override
     public void onDisable() {
+        if (ocmWatchTask != null) ocmWatchTask.cancel();
+        if (metrics != null) metrics.shutdown();
+
         // On a normal shutdown players quit before plugins disable, so this
         // only matters for runtime disables (e.g. plugin managers, /reload).
-        for (Player player : getServer().getOnlinePlayers()) {
-            try {
-                stripInventory(player);
-            } catch (Exception ignored) {
-            }
-        }
-        blockHitCooldowns.clear();
-    }
-
-    @Override
-    public boolean onCommand(@NotNull CommandSender sender, @NotNull Command command, @NotNull String label, @NotNull String @NotNull [] args) {
-        if (args.length == 1 && args[0].equalsIgnoreCase("reload")) {
-            ocmReader.reload();
-            if (config.load()) {
-                for (Player player : getServer().getOnlinePlayers()) {
-                    player.getScheduler().run(this, task -> updateInventory(player), null);
+        if (normalizer != null) {
+            for (Player player : getServer().getOnlinePlayers()) {
+                if (tracker != null) tracker.stop(player);
+                try {
+                    normalizer.stripPlayer(player);
+                } catch (Exception ignored) {
                 }
-                sender.sendMessage(Component.text("VanillaSwordBlocking config reloaded.", NamedTextColor.GREEN));
-            } else {
-                sender.sendMessage(Component.text("config.yml contains errors - keeping the previous settings. See the console for details.", NamedTextColor.RED));
             }
-            return true;
         }
-        sender.sendMessage(Component.text("Usage: /" + label + " reload", NamedTextColor.RED));
-        return true;
+        VanillaBlockingApi.uninstall();
+        if (service != null) service.clearAllCooldowns();
+        if (worldGuard != null) worldGuard.disable();
     }
 
-    @Override
-    public @NotNull List<String> onTabComplete(@NotNull CommandSender sender, @NotNull Command command, @NotNull String label, @NotNull String @NotNull [] args) {
-        if (args.length == 1 && "reload".startsWith(args[0].toLowerCase(Locale.ROOT))) return List.of("reload");
-        return List.of();
-    }
+    private void registerListeners() {
+        getServer().getPluginManager().registerEvents(
+                new CombatListener(this, service, normalizer, tracker, messages), this);
+        getServer().getPluginManager().registerEvents(
+                new ItemLifecycleListener(this, service, normalizer, tracker), this);
 
-    /**
-     * Damage reduction while blocking. Bukkit's base damage is the
-     * pre-armor value, which is also where 1.8.9 applied blocking.
-     */
-    @EventHandler(ignoreCancelled = true)
-    public void onDamagePlayer(@NotNull EntityDamageEvent event) {
-        if (!(event.getEntity() instanceof Player player)) return;
-        if (!config.isActiveIn(player.getWorld())) return;
-        if (!config.isBlockable(event.getCause())) return;
-        if (!isBlocking(player)) return;
-
-        event.setDamage(config.applyBlocking(event.getDamage()));
-    }
-
-    /**
-     * Block-hitting: a player attacking while blocking. With block-hitting
-     * enabled (1.8.9 behavior) the block is never interrupted and an
-     * optional outgoing damage multiplier applies; with it disabled the
-     * block is interrupted and re-blocking is prevented for a while.
-     */
-    @EventHandler(ignoreCancelled = true)
-    public void onAttackWhileBlocking(@NotNull EntityDamageByEntityEvent event) {
-        if (!(event.getDamager() instanceof Player attacker)) return;
-        DamageCause cause = event.getCause();
-        if (cause != DamageCause.ENTITY_ATTACK && cause != DamageCause.ENTITY_SWEEP_ATTACK) return;
-        if (!config.isActiveIn(attacker.getWorld())) return;
-        if (!isBlocking(attacker)) return;
-
-        if (config.blockHittingEnabled()) {
-            if (config.blockHitDamageMultiplier() != 1.0) {
-                event.setDamage(event.getDamage() * config.blockHitDamageMultiplier());
-            }
-        } else {
-            interruptBlocking(attacker);
+        // A PlayerMoveEvent handler is only worth its dispatch cost when
+        // region control can actually change the answer.
+        if (config.respectWorldGuard() && Bukkit.getPluginManager().isPluginEnabled("WorldGuard")) {
+            getServer().getPluginManager().registerEvents(new RegionListener(service, normalizer), this);
         }
     }
 
-    /**
-     * Optional knockback reduction while blocking (1.8.9 default is no
-     * reduction, so this is skipped entirely at the authentic setting).
-     */
-    @EventHandler(ignoreCancelled = true)
-    public void onKnockback(@NotNull EntityKnockbackEvent event) {
-        if (config.knockbackMultiplier() == 1.0) return;
-        if (!(event.getEntity() instanceof Player player)) return;
-        if (!config.isActiveIn(player.getWorld())) return;
-        if (!isBlocking(player)) return;
-
-        event.setKnockback(event.getKnockback().multiply(config.knockbackMultiplier()));
-    }
-
-    /**
-     * Fires when an item is inserted/replaced in a slot,
-     * including when the slot is already selected.
-     */
-    @EventHandler
-    public void onSlotChange(@NotNull PlayerInventorySlotChangeEvent event) {
-        int slot = event.getSlot();
-        if (slot == OFFHAND_SLOT) {
-            // A shield (or offhand weapon) appearing or disappearing
-            // affects whether the whole hotbar may block
-            updateInventory(event.getPlayer());
+    private void registerCommand() {
+        PluginCommand command = getCommand("vanillablocking");
+        if (command == null) {
+            getSLF4JLogger().error("The /vanillablocking command is missing from plugin.yml.");
             return;
         }
-        if (slot >= 0 && slot <= 8) {
-            normalizeSlot(event.getPlayer(), slot);
+        VanillaBlockingCommand executor = new VanillaBlockingCommand(this, service, normalizer, ocmReader, messages);
+        command.setExecutor(executor);
+        command.setTabCompleter(executor);
+    }
+
+    /**
+     * Applies config and lang changes at runtime.
+     *
+     * @return false when config.yml could not be parsed, in which case the
+     * previous settings stay in effect
+     */
+    public boolean reload() {
+        boolean ok = config.load();
+        messages.load();
+        ocmReader.reload();
+        ocmDisplay.setEnabled(config.ocmTooltipCompat());
+
+        BlockingStrategy previous = service.strategy();
+        BlockingStrategy strategy = BlockingStrategies.create(config, getSLF4JLogger());
+        strategy.configure(config);
+        service.strategy(strategy);
+
+        warnAboutOcmConflicts();
+        startOcmWatcher();
+        tracker.refreshSlowdowns();
+
+        // Switching strategies leaves the old one's component on every item
+        // in every inventory, and the new strategy would not recognise it.
+        boolean switched = !previous.id().equals(strategy.id());
+
+        for (Player player : getServer().getOnlinePlayers()) {
+            player.getScheduler().run(this, task -> {
+                if (switched) normalizer.stripPlayer(player, previous);
+                normalizer.normalizeInventory(player);
+            }, null);
         }
-        // The tooltip fix applies to any slot, not just the hotbar
-        if (slot >= 0 && slot < event.getPlayer().getInventory().getSize()) {
-            updateOcmDisplay(event.getPlayer(), slot);
+        return ok;
+    }
+
+    /**
+     * OldCombatMechanics has a sword-blocking module of its own that fakes
+     * blocking by swapping the sword for a shield. Two plugins fighting over
+     * the same right-click is worth shouting about.
+     */
+    private void warnAboutOcmConflicts() {
+        if (!ocmReader.isPresent()) return;
+
+        if (ocmReader.isSwordBlockingModuleEnabled()) {
+            getSLF4JLogger().warn("""
+                    OldCombatMechanics' own sword-blocking module is enabled.
+                    Both plugins will fight over the same right-click, and blocking will behave unpredictably.
+                    Turn off 'sword-blocking' in OldCombatMechanics' config.yml, or turn this plugin off.""");
+        }
+
+        if (!ocmReader.isAttackCooldownDisabled()) {
+            getSLF4JLogger().warn("OldCombatMechanics is installed but its attack cooldown module is off. "
+                    + "Block-hitting is a 1.8 technique and feels wrong with the 1.9 attack cooldown - "
+                    + "consider enabling 'disable-attack-cooldown'.");
         }
     }
 
     /**
-     * Hotbar scroll fallback
+     * OCM has no reload API and no reload event, so the only way to notice
+     * an admin running its reload command is to watch the file.
      */
-    @EventHandler
-    public void onItemChangeEvent(@NotNull PlayerItemHeldEvent event) {
-        normalizeSlot(event.getPlayer(), event.getNewSlot());
+    private void startOcmWatcher() {
+        if (ocmWatchTask != null) {
+            ocmWatchTask.cancel();
+            ocmWatchTask = null;
+        }
+        if (!config.ocmWatchConfig() || !ocmReader.isPresent()) return;
+
+        long seconds = config.ocmWatchIntervalSeconds();
+        ocmWatchTask = Bukkit.getAsyncScheduler().runAtFixedRate(this, task -> {
+            // File I/O off the server threads, then hand the player work back
+            // to the server so Folia's region rules are respected.
+            if (!ocmReader.reloadIfChanged()) return;
+            getSLF4JLogger().info("OldCombatMechanics' config changed - reloaded its settings.");
+            Bukkit.getGlobalRegionScheduler().execute(this, this::refreshAllPlayers);
+        }, seconds, seconds, TimeUnit.SECONDS);
     }
 
     /**
-     * Normalize inventory on join
+     * Re-applies blocking items for everyone, each on their own scheduler.
      */
-    @EventHandler
-    public void onJoin(@NotNull PlayerJoinEvent event) {
-        updateInventory(event.getPlayer());
+    private void refreshAllPlayers() {
+        for (Player player : getServer().getOnlinePlayers()) {
+            player.getScheduler().run(this, task -> normalizer.normalizeInventory(player), null);
+        }
+    }
+
+    private void startUpdateChecker() {
+        if (!config.updateCheckerEnabled()) return;
+
+        UpdateChecker checker = new UpdateChecker(getSLF4JLogger(),
+                config.updateCheckerProject(), getPluginMeta().getVersion());
+        Bukkit.getAsyncScheduler().runNow(this, task -> checker.check());
+    }
+
+    private void startMetrics() {
+        if (!config.metricsEnabled() || BSTATS_PLUGIN_ID == 0) return;
+
+        metrics = new Metrics(this, BSTATS_PLUGIN_ID);
+        metrics.addCustomChart(new SimplePie("blocking_strategy", () -> service.strategy().id()));
+        metrics.addCustomChart(new SimplePie("damage_formula", () -> config.formula().name().toLowerCase(java.util.Locale.ROOT)));
+        metrics.addCustomChart(new SimplePie("block_hitting", () -> String.valueOf(config.blockHittingEnabled())));
+        metrics.addCustomChart(new SimplePie("oldcombatmechanics", () -> String.valueOf(ocmReader.isPresent())));
     }
 
     /**
-     * Re-normalize when moving between worlds (blocking may be disabled
-     * in the destination world).
+     * Registers the PlaceholderAPI expansion, if that plugin is installed.
+     * <p>
+     * Loaded and called by name for the same reason as the WorldGuard hook:
+     * naming PlaceholderHook here would make this class depend on
+     * PlaceholderAPI being on the class path.
      */
-    @EventHandler
-    public void onWorldChange(@NotNull PlayerChangedWorldEvent event) {
-        updateInventory(event.getPlayer());
-    }
+    private void registerPlaceholders() {
+        if (!Bukkit.getPluginManager().isPluginEnabled("PlaceholderAPI")) return;
 
-    /**
-     * Cleanup on leave, so no modified components end up saved to disk
-     */
-    @EventHandler
-    public void onDisconnect(@NotNull PlayerQuitEvent event) {
-        blockHitCooldowns.remove(event.getPlayer().getUniqueId());
         try {
-            stripInventory(event.getPlayer());
-        } catch (Exception ignored) {
-        }
-    }
-
-    @EventHandler
-    public void onKick(@NotNull PlayerKickEvent event) {
-        try {
-            stripInventory(event.getPlayer());
-        } catch (Exception ignored) {
-        }
-    }
-
-    /**
-     * Whether the player is actively blocking right now, respecting all
-     * config restrictions. Only items with our BLOCK-animation component
-     * count, so eating food never triggers this.
-     */
-    private boolean isBlocking(@NotNull Player player) {
-        if (isOnBlockHitCooldown(player.getUniqueId())) return false;
-
-        var handle = ((CraftPlayer) player).getHandle();
-        var useItem = handle.getUseItem();
-        if (useItem.isEmpty() || useItem.getUseAnimation() != ItemUseAnimation.BLOCK) return false;
-        if (!config.isBlockableItem(CraftMagicNumbers.getMaterial(useItem.getItem()))) return false;
-        if (!config.allowOffhand() && handle.getUsedItemHand() != InteractionHand.MAIN_HAND) return false;
-        return !hasShieldConflict(player);
-    }
-
-    private boolean hasShieldConflict(@NotNull Player player) {
-        return !config.allowWithShield() && player.getInventory().getItemInOffHand().getType() == Material.SHIELD;
-    }
-
-    private boolean isOnBlockHitCooldown(@NotNull UUID uuid) {
-        Long expiry = blockHitCooldowns.get(uuid);
-        return expiry != null && System.currentTimeMillis() < expiry;
-    }
-
-    /**
-     * Interrupts a block (block-hitting disabled): stops the item use,
-     * strips the blocking components so the client lowers the item too,
-     * and restores them once the cooldown expires.
-     */
-    private void interruptBlocking(@NotNull Player player) {
-        ((CraftPlayer) player).getHandle().stopUsingItem();
-        blockHitCooldowns.put(player.getUniqueId(), System.currentTimeMillis() + config.interruptTicks() * 50L);
-        updateInventory(player);
-
-        player.getScheduler().runDelayed(this, task -> {
-            if (!isOnBlockHitCooldown(player.getUniqueId())) {
-                blockHitCooldowns.remove(player.getUniqueId());
-                updateInventory(player);
-            }
-        }, null, config.interruptTicks() + 1L);
-    }
-
-    private boolean isBlockingSlot(int slot) {
-        return (slot >= 0 && slot <= 8) || (slot == OFFHAND_SLOT && config.allowOffhand());
-    }
-
-    /**
-     * Ensures the item in the given slot has the blocking component exactly
-     * when it should: a configured blockable item, in a blocking slot, in a
-     * world where blocking is active, with no shield conflict or block-hit
-     * cooldown. Everything else gets the component stripped.
-     */
-    private void normalizeSlot(@NotNull Player player, int slot) {
-        PlayerInventory inventory = player.getInventory();
-        ItemStack stack = inventory.getItem(slot);
-        if (stack == null || stack.getType().isAir()) return;
-        if (!config.isBlockableItem(stack.getType()) && !stack.hasItemMeta()) return;
-
-        net.minecraft.world.item.ItemStack nms = CraftItemStack.asNMSCopy(stack);
-        if (!VanillaBlocking.canReceiveBlockingComponent(nms)) return;
-
-        boolean shouldBlock = config.isActiveIn(player.getWorld())
-                && config.isBlockableItem(stack.getType())
-                && isBlockingSlot(slot)
-                && !hasShieldConflict(player)
-                && !isOnBlockHitCooldown(player.getUniqueId());
-        if (VanillaBlocking.hasBlockingComponent(nms) == shouldBlock) return;
-
-        if (shouldBlock) {
-            VanillaBlocking.addBlockingComponent(nms);
-        } else {
-            VanillaBlocking.removeBlockingComponent(nms);
-        }
-        inventory.setItem(slot, CraftItemStack.asBukkitCopy(nms));
-    }
-
-    /**
-     * Normalizes a whole inventory.
-     */
-    private void updateInventory(@NotNull Player player) {
-        for (int slot = 0; slot < player.getInventory().getSize(); slot++) {
-            normalizeSlot(player, slot);
-            updateOcmDisplay(player, slot);
-        }
-    }
-
-    /**
-     * Applies OCM's old-tool-damage value to an item's tooltip. Unlike
-     * blocking this covers every item OCM configures (axes and other tools
-     * included), not just blockable ones, and is a no-op when OCM is not
-     * installed or not active in this world.
-     */
-    private void updateOcmDisplay(@NotNull Player player, int slot) {
-        PlayerInventory inventory = player.getInventory();
-        ItemStack stack = inventory.getItem(slot);
-        if (stack == null || stack.getType().isAir()) return;
-
-        if (ocmDisplay.updateItemForPlayer(player, stack)) {
-            inventory.setItem(slot, stack);
-        }
-    }
-
-    /**
-     * Removes the blocking component from every item in the inventory.
-     */
-    private void stripInventory(@NotNull Player player) {
-        PlayerInventory inventory = player.getInventory();
-
-        for (int slot = 0; slot < inventory.getSize(); slot++) {
-            ItemStack stack = inventory.getItem(slot);
-            if (stack == null || stack.getType().isAir()) continue;
-
-            net.minecraft.world.item.ItemStack nms = CraftItemStack.asNMSCopy(stack);
-            if (VanillaBlocking.hasBlockingComponent(nms)) {
-                VanillaBlocking.removeBlockingComponent(nms);
-                stack = CraftItemStack.asBukkitCopy(nms);
-                inventory.setItem(slot, stack);
-            }
-
-            // Our tooltip modifier must not be saved to disk either
-            if (ocmDisplay.forceRemove(stack)) {
-                inventory.setItem(slot, stack);
-            }
+            Class<?> hook = Class.forName("net.player005.vanillablocking.compat.PlaceholderHook");
+            Object expansion = hook.getDeclaredConstructor(org.bukkit.plugin.Plugin.class, BlockingService.class)
+                    .newInstance(this, service);
+            expansion.getClass().getMethod("register").invoke(expansion);
+            getSLF4JLogger().info("Registered PlaceholderAPI placeholders.");
+        } catch (Throwable throwable) {
+            getSLF4JLogger().warn("Could not register PlaceholderAPI placeholders.", throwable);
         }
     }
 }
