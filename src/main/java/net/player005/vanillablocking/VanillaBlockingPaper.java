@@ -40,6 +40,8 @@ public class VanillaBlockingPaper extends JavaPlugin implements Listener {
     private static final int OFFHAND_SLOT = 40;
 
     private PluginConfig config;
+    private OcmConfigReader ocmReader;
+    private OcmDamageDisplay ocmDisplay;
 
     /**
      * Only used when block-hitting is disabled: players who recently
@@ -52,6 +54,12 @@ public class VanillaBlockingPaper extends JavaPlugin implements Listener {
     public void onEnable() {
         config = new PluginConfig(this);
         config.load();
+
+        // OldCombatMechanics tooltip compatibility (no-op when OCM is absent)
+        ocmReader = new OcmConfigReader();
+        ocmReader.reload();
+        ocmDisplay = new OcmDamageDisplay(this, ocmReader);
+
         getServer().getPluginManager().registerEvents(this, this);
 
         // Handles being enabled on a running server (e.g. via a plugin
@@ -77,6 +85,7 @@ public class VanillaBlockingPaper extends JavaPlugin implements Listener {
     @Override
     public boolean onCommand(@NotNull CommandSender sender, @NotNull Command command, @NotNull String label, @NotNull String @NotNull [] args) {
         if (args.length == 1 && args[0].equalsIgnoreCase("reload")) {
+            ocmReader.reload();
             if (config.load()) {
                 for (Player player : getServer().getOnlinePlayers()) {
                     player.getScheduler().run(this, task -> updateInventory(player), null);
@@ -159,8 +168,14 @@ public class VanillaBlockingPaper extends JavaPlugin implements Listener {
             // A shield (or offhand weapon) appearing or disappearing
             // affects whether the whole hotbar may block
             updateInventory(event.getPlayer());
-        } else if (slot >= 0 && slot <= 8) {
+            return;
+        }
+        if (slot >= 0 && slot <= 8) {
             normalizeSlot(event.getPlayer(), slot);
+        }
+        // The tooltip fix applies to any slot, not just the hotbar
+        if (slot >= 0 && slot < event.getPlayer().getInventory().getSize()) {
+            updateOcmDisplay(event.getPlayer(), slot);
         }
     }
 
@@ -292,6 +307,23 @@ public class VanillaBlockingPaper extends JavaPlugin implements Listener {
     private void updateInventory(@NotNull Player player) {
         for (int slot = 0; slot < player.getInventory().getSize(); slot++) {
             normalizeSlot(player, slot);
+            updateOcmDisplay(player, slot);
+        }
+    }
+
+    /**
+     * Applies OCM's old-tool-damage value to an item's tooltip. Unlike
+     * blocking this covers every item OCM configures (axes and other tools
+     * included), not just blockable ones, and is a no-op when OCM is not
+     * installed or not active in this world.
+     */
+    private void updateOcmDisplay(@NotNull Player player, int slot) {
+        PlayerInventory inventory = player.getInventory();
+        ItemStack stack = inventory.getItem(slot);
+        if (stack == null || stack.getType().isAir()) return;
+
+        if (ocmDisplay.updateItemForPlayer(player, stack)) {
+            inventory.setItem(slot, stack);
         }
     }
 
@@ -306,10 +338,16 @@ public class VanillaBlockingPaper extends JavaPlugin implements Listener {
             if (stack == null || stack.getType().isAir()) continue;
 
             net.minecraft.world.item.ItemStack nms = CraftItemStack.asNMSCopy(stack);
-            if (!VanillaBlocking.hasBlockingComponent(nms)) continue;
+            if (VanillaBlocking.hasBlockingComponent(nms)) {
+                VanillaBlocking.removeBlockingComponent(nms);
+                stack = CraftItemStack.asBukkitCopy(nms);
+                inventory.setItem(slot, stack);
+            }
 
-            VanillaBlocking.removeBlockingComponent(nms);
-            inventory.setItem(slot, CraftItemStack.asBukkitCopy(nms));
+            // Our tooltip modifier must not be saved to disk either
+            if (ocmDisplay.forceRemove(stack)) {
+                inventory.setItem(slot, stack);
+            }
         }
     }
 }
